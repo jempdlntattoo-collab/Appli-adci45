@@ -1,4 +1,4 @@
-import { canAccess, currentUser, DB, ensureSeed, logActivity } from "../data";
+import { BUCKET, canAccess, canAdminProject, currentUser, DB, ensureSeed, logActivity } from "../data";
 
 export const dynamic = "force-dynamic";
 
@@ -10,7 +10,7 @@ export async function GET(request:Request) {
       WHERE p.created_by=? OR m.user_id=? OR lower(m.email)=lower(?) ORDER BY p.created_at`).bind(user.userId,user.userId,user.email).all();
     const projects=projectsResult.results as Record<string,unknown>[];
     const projectId=(requested && projects.some(p=>p.id===requested) ? requested : projects[0]?.id) as string|undefined;
-    if(!projectId) return Response.json({user,projects:[],events:[],notes:[],files:[],members:[],activities:[],timer:null});
+    if(!projectId) return Response.json({user,projects:[],events:[],notes:[],files:[],members:[],activities:[],timer:null,canAdminProject:false});
     const [events,notes,files,members,activities,timer]=await Promise.all([
       DB.prepare("SELECT e.*,p.name project_name,p.address,p.color FROM events e JOIN projects p ON p.id=e.project_id WHERE e.project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?)) ORDER BY starts_at").bind(user.userId,user.userId,user.email).all(),
       DB.prepare("SELECT * FROM notes WHERE project_id=? ORDER BY created_at DESC").bind(projectId).all(),
@@ -19,7 +19,8 @@ export async function GET(request:Request) {
       DB.prepare("SELECT * FROM activities WHERE project_id=? ORDER BY created_at DESC LIMIT 20").bind(projectId).all(),
       DB.prepare("SELECT * FROM time_entries WHERE user_id=? AND ends_at IS NULL ORDER BY starts_at DESC LIMIT 1").bind(user.userId).first(),
     ]);
-    return Response.json({user,projects,selectedProjectId:projectId,events:events.results,notes:notes.results,files:files.results,members:members.results,activities:activities.results,timer});
+    const isProjectAdmin=await canAdminProject(projectId,user.userId,user.email);
+    return Response.json({user,projects,selectedProjectId:projectId,events:events.results,notes:notes.results,files:files.results,members:members.results,activities:activities.results,timer,canAdminProject:isProjectAdmin});
   } catch(e) { if(e instanceof Response)return e; console.error(e); return Response.json({error:"Données temporairement indisponibles."},{status:500}); }
 }
 
@@ -34,6 +35,23 @@ export async function POST(request:Request) {
       ]); await logActivity(id,user,"project_created","Chantier créé"); return Response.json({ok:true,id});
     }
     const projectId=String(body.projectId||""); if(!await canAccess(projectId,user.userId,user.email)) return new Response("Accès refusé",{status:403});
+    if(body.action==="deleteProject"){
+      if(!await canAdminProject(projectId,user.userId,user.email)) return Response.json({error:"Seul un administrateur peut supprimer ce chantier."},{status:403});
+      const files=await DB.prepare("SELECT object_key FROM files WHERE project_id=?").bind(projectId).all<{object_key:string}>();
+      await Promise.all(files.results.map(file=>BUCKET.delete(file.object_key)));
+      await DB.prepare("DELETE FROM projects WHERE id=?").bind(projectId).run();
+      return Response.json({ok:true,deleted:true});
+    }
+    if(body.action==="setMemberRole"){
+      if(!await canAdminProject(projectId,user.userId,user.email)) return Response.json({error:"Seul un administrateur peut modifier les rôles."},{status:403});
+      const role=body.role==="admin"?"admin":"member";
+      const memberId=String(body.memberId||"");
+      const member=await DB.prepare("SELECT id FROM project_members WHERE id=? AND project_id=?").bind(memberId,projectId).first();
+      if(!member) return Response.json({error:"Utilisateur introuvable."},{status:404});
+      await DB.prepare("UPDATE project_members SET role=? WHERE id=? AND project_id=?").bind(role,memberId,projectId).run();
+      await logActivity(projectId,user,"member_role_updated",role==="admin"?"Un administrateur a été nommé":"Un administrateur est devenu membre");
+      return Response.json({ok:true});
+    }
     if(body.action==="addNote"){
       const id=crypto.randomUUID(); await DB.prepare("INSERT INTO notes (id,project_id,body,done,author_id,author_name,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").bind(id,projectId,String(body.body).slice(0,1000),0,user.userId,user.displayName,now,now).run();
       await logActivity(projectId,user,"note_added","Modification ajoutée"); return Response.json({ok:true,id});
@@ -49,6 +67,7 @@ export async function POST(request:Request) {
       return Response.json({ok:true});
     }
     if(body.action==="invite"){
+      if(!await canAdminProject(projectId,user.userId,user.email)) return Response.json({error:"Seul un administrateur peut inviter et choisir les rôles."},{status:403});
       const email=String(body.email||"").trim().toLowerCase(); if(!email.includes("@")) return Response.json({error:"Adresse e-mail invalide"},{status:400});
       await DB.prepare("INSERT INTO project_members (id,project_id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(project_id,email) DO UPDATE SET status='invited', role=excluded.role").bind(crypto.randomUUID(),projectId,null,email,String(body.name||email.split("@")[0]).slice(0,80),String(body.role||"member"),"invited",now).run();
       await logActivity(projectId,user,"member_invited",`Invitation préparée pour ${email}`); return Response.json({ok:true});
