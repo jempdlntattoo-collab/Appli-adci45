@@ -21,6 +21,10 @@ export function ensureSchema() {
         created_at TEXT NOT NULL
       )`),
       DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (email)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS user_settings (
+        user_id TEXT PRIMARY KEY NOT NULL,
+        seeded_at TEXT NOT NULL
+      )`),
       DB.prepare(`CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
@@ -141,9 +145,14 @@ export async function currentUser(request: Request) {
 }
 
 export async function ensureSeed(user: Awaited<ReturnType<typeof currentUser>>) {
+  const seeded = await DB.prepare("SELECT user_id FROM user_settings WHERE user_id=? LIMIT 1").bind(user.userId).first();
+  if (seeded) return;
   const found = await DB.prepare("SELECT id FROM projects WHERE created_by=? LIMIT 1").bind(user.userId).first();
-  if (found) return;
   const now = new Date().toISOString();
+  if (found) {
+    await DB.prepare("INSERT OR IGNORE INTO user_settings (user_id,seeded_at) VALUES (?,?)").bind(user.userId,now).run();
+    return;
+  }
   const p1 = crypto.randomUUID(), p2 = crypto.randomUUID(), p3 = crypto.randomUUID();
   const day = new Date();
   const at = (hour:number, minute=0) => { const d=new Date(day); d.setHours(hour,minute,0,0); return d.toISOString(); };
@@ -161,12 +170,20 @@ export async function ensureSeed(user: Awaited<ReturnType<typeof currentUser>>) 
     DB.prepare("INSERT INTO events (id,project_id,title,starts_at,ends_at,created_by,created_at) VALUES (?,?,?,?,?,?,?)").bind(crypto.randomUUID(),p3,"Visite et métrés",at(16,45),at(17,30),user.userId,now),
     DB.prepare("INSERT INTO notes (id,project_id,body,done,author_id,author_name,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),p1,"Décaler la prise de 8 cm à gauche avant la pose du dosseret.",0,user.userId,user.displayName,now,now),
     DB.prepare("INSERT INTO notes (id,project_id,body,done,author_id,author_name,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),p1,"Façades hautes validées en chêne naturel.",1,user.userId,user.displayName,now,now),
+    DB.prepare("INSERT INTO user_settings (user_id,seeded_at) VALUES (?,?)").bind(user.userId,now),
   ]);
 }
 
 export async function canAccess(projectId:string, userId:string, email:string) {
   const row = await DB.prepare(`SELECT p.id FROM projects p LEFT JOIN project_members m ON m.project_id=p.id
     WHERE p.id=? AND (p.created_by=? OR m.user_id=? OR lower(m.email)=lower(?)) LIMIT 1`).bind(projectId,userId,userId,email).first();
+  return Boolean(row);
+}
+
+export async function canAdminProject(projectId:string, userId:string, email:string) {
+  const row = await DB.prepare(`SELECT p.id FROM projects p LEFT JOIN project_members m ON m.project_id=p.id
+    WHERE p.id=? AND (p.created_by=? OR ((m.user_id=? OR lower(m.email)=lower(?)) AND m.role='admin')) LIMIT 1`)
+    .bind(projectId,userId,userId,email).first();
   return Boolean(row);
 }
 
