@@ -4,8 +4,122 @@ import { auth, clerkClient } from "@clerk/nextjs/server";
 export const DB = env.DB!;
 export const BUCKET = env.BUCKET!;
 
+let schemaReady: Promise<void> | undefined;
+
+/**
+ * Cloudflare creates the D1 database separately from the Worker deployment.
+ * Initialise the small application schema on first use so a brand-new binding
+ * can serve the dashboard without requiring a manual SQL-console step.
+ */
+export function ensureSchema() {
+  if (!schemaReady) {
+    schemaReady = DB.batch([
+      DB.prepare(`CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY NOT NULL,
+        email TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`),
+      DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (email)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        address TEXT NOT NULL,
+        status TEXT DEFAULT 'active' NOT NULL,
+        color TEXT DEFAULT '#3c73c9' NOT NULL,
+        due_date TEXT,
+        progress INTEGER DEFAULT 0 NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_projects_status ON projects (status)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS project_members (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL,
+        user_id TEXT,
+        email TEXT,
+        display_name TEXT NOT NULL,
+        role TEXT DEFAULT 'member' NOT NULL,
+        status TEXT DEFAULT 'active' NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )`),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_members_project ON project_members (project_id)"),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_members_user ON project_members (user_id)"),
+      DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_members_project_email ON project_members (project_id, email)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        starts_at TEXT NOT NULL,
+        ends_at TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )`),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_events_project_start ON events (project_id, starts_at)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS files (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL,
+        object_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        kind TEXT DEFAULT 'document' NOT NULL,
+        uploaded_by TEXT NOT NULL,
+        uploaded_by_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )`),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_files_project_created ON files (project_id, created_at)"),
+      DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_object_key ON files (object_key)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS notes (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        done INTEGER DEFAULT 0 NOT NULL,
+        author_id TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )`),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_notes_project_created ON notes (project_id, created_at)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS time_entries (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        user_name TEXT NOT NULL,
+        starts_at TEXT NOT NULL,
+        ends_at TEXT,
+        duration_seconds INTEGER DEFAULT 0 NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )`),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_time_user_start ON time_entries (user_id, starts_at)"),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_time_project ON time_entries (project_id)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS activities (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        actor_name TEXT NOT NULL,
+        action TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )`),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_activity_project_created ON activities (project_id, created_at)"),
+    ]).then(() => undefined).catch((error) => {
+      schemaReady = undefined;
+      throw error;
+    });
+  }
+  return schemaReady;
+}
+
 export async function currentUser(request: Request) {
   void request;
+  await ensureSchema();
   const { userId } = await auth();
   if (!userId) throw new Response("Non autorisé", { status: 401 });
 
