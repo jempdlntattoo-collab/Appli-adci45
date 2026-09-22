@@ -25,6 +25,18 @@ export function ensureSchema() {
         user_id TEXT PRIMARY KEY NOT NULL,
         seeded_at TEXT NOT NULL
       )`),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS company_members (
+        id TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT,
+        email TEXT,
+        display_name TEXT NOT NULL,
+        role TEXT DEFAULT 'member' NOT NULL,
+        status TEXT DEFAULT 'active' NOT NULL,
+        avatar_key TEXT,
+        avatar_content_type TEXT,
+        created_at TEXT NOT NULL
+      )`),
+      DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_company_members_email ON company_members (email)"),
       DB.prepare(`CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
@@ -149,7 +161,19 @@ export async function currentUser(request: Request) {
   await DB.prepare(`INSERT INTO users (id,email,display_name,created_at) VALUES (?,?,?,?)
     ON CONFLICT(id) DO UPDATE SET email=excluded.email, display_name=excluded.display_name`)
     .bind(user.userId, user.email, user.displayName, now).run();
+  await DB.prepare(`INSERT INTO company_members (id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, email=excluded.email, display_name=excluded.display_name, status='active'`)
+    .bind(`email:${user.email.toLowerCase()}`,user.userId,user.email.toLowerCase(),user.displayName,"member","active",now).run();
   return user;
+}
+
+export async function syncCompanyMembers() {
+  await DB.prepare(`INSERT OR IGNORE INTO company_members (id,user_id,email,display_name,role,status,created_at)
+    SELECT CASE WHEN email IS NOT NULL AND email<>'' THEN 'email:'||lower(email) ELSE 'member:'||id END,
+      user_id,lower(email),display_name,role,status,created_at FROM project_members`).run();
+  await DB.prepare(`UPDATE company_members SET role='admin' WHERE id IN (
+    SELECT CASE WHEN email IS NOT NULL AND email<>'' THEN 'email:'||lower(email) ELSE 'member:'||id END
+    FROM project_members WHERE role='admin')`).run();
 }
 
 export async function ensureSeed(user: Awaited<ReturnType<typeof currentUser>>) {
@@ -192,6 +216,13 @@ export async function canAdminProject(projectId:string, userId:string, email:str
   const row = await DB.prepare(`SELECT p.id FROM projects p LEFT JOIN project_members m ON m.project_id=p.id
     WHERE p.id=? AND (p.created_by=? OR ((m.user_id=? OR lower(m.email)=lower(?)) AND m.role='admin')) LIMIT 1`)
     .bind(projectId,userId,userId,email).first();
+  return Boolean(row);
+}
+
+export async function canAdminCompany(userId:string, email:string) {
+  const row=await DB.prepare(`SELECT p.id FROM projects p LEFT JOIN project_members m ON m.project_id=p.id
+    WHERE p.created_by=? OR ((m.user_id=? OR lower(m.email)=lower(?)) AND m.role='admin') LIMIT 1`)
+    .bind(userId,userId,email).first();
   return Boolean(row);
 }
 
