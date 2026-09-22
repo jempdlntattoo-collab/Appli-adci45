@@ -9,10 +9,15 @@ export async function POST(request:Request) {
     if(!await canAccess(projectId,user.userId,user.email)) return new Response("Accès refusé",{status:403});
     if(!(file instanceof File) || file.size===0) return Response.json({error:"Aucun fichier"},{status:400});
     if(file.size>25*1024*1024) return Response.json({error:"Fichier limité à 25 Mo"},{status:400});
-    const id=crypto.randomUUID(); const key=`${projectId}/${id}`; const kind=file.type.startsWith("image/")?"photo":"document"; const now=new Date().toISOString();
-    await BUCKET.put(key,file.stream(),{httpMetadata:{contentType:file.type||"application/octet-stream"}});
+    const id=crypto.randomUUID(); const key=`${projectId}/${id}`;
+    const extension=file.name.split(".").pop()?.toLowerCase()||"";
+    const isImage=file.type.startsWith("image/")||["heic","heif","jpg","jpeg","png","webp"].includes(extension);
+    const kind=isImage?"photo":"document"; const now=new Date().toISOString();
+    const contentType=file.type&&/^[\w.+-]+\/[\w.+-]+$/.test(file.type)?file.type:(isImage?"image/jpeg":"application/octet-stream");
+    const bytes=await file.arrayBuffer();
+    await BUCKET.put(key,bytes,{httpMetadata:{contentType}});
     try {
-      await DB.prepare("INSERT INTO files (id,project_id,object_key,name,content_type,size,kind,uploaded_by,uploaded_by_name,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(id,projectId,key,file.name,file.type||"application/octet-stream",file.size,kind,user.userId,user.displayName,now).run();
+      await DB.prepare("INSERT INTO files (id,project_id,object_key,name,content_type,size,kind,uploaded_by,uploaded_by_name,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(id,projectId,key,file.name,contentType,file.size,kind,user.userId,user.displayName,now).run();
     } catch(e) { await BUCKET.delete(key); throw e; }
     await logActivity(projectId,user,kind==="photo"?"photo_added":"file_added",file.name);
     return Response.json({ok:true,id});
