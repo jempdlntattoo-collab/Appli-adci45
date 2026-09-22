@@ -24,6 +24,30 @@ const days=["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"];
 const fmtTime=(iso:string)=>new Date(iso).toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"});
 const fmtDate=(iso:string)=>new Date(iso).toLocaleDateString("fr-FR",{day:"numeric",month:"short"});
 const initials=(name:string)=>name.split(/\s+/).map(x=>x[0]).join("").slice(0,2).toUpperCase();
+const imageExtensions=["heic","heif","jpg","jpeg","png","webp"];
+const isImageFile=(file:File)=>file.type.startsWith("image/")||imageExtensions.includes(file.name.split(".").pop()?.toLowerCase()||"");
+
+async function prepareUploadFile(file:File){
+  if(!isImageFile(file)||file.size<=700*1024)return file;
+  const url=URL.createObjectURL(file);
+  try{
+    const image=await new Promise<HTMLImageElement>((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=()=>reject(new Error("Cette photo ne peut pas être préparée."));img.src=url});
+    let width=image.naturalWidth,height=image.naturalHeight;
+    const maxSide=1600;
+    if(Math.max(width,height)>maxSide){const ratio=maxSide/Math.max(width,height);width=Math.round(width*ratio);height=Math.round(height*ratio)}
+    const canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;
+    const context=canvas.getContext("2d");if(!context)throw new Error("Cette photo ne peut pas être préparée.");
+    context.fillStyle="#fff";context.fillRect(0,0,width,height);context.drawImage(image,0,0,width,height);
+    let result:Blob|null=null;
+    for(const quality of [0.82,0.7,0.58]){
+      result=await new Promise(resolve=>canvas.toBlob(resolve,"image/jpeg",quality));
+      if(result&&result.size<=700*1024)break;
+    }
+    if(!result)throw new Error("Cette photo ne peut pas être préparée.");
+    const name=file.name.replace(/\.[^.]+$/,"")||"photo";
+    return new File([result],`${name}.jpg`,{type:"image/jpeg",lastModified:Date.now()});
+  }finally{URL.revokeObjectURL(url)}
+}
 
 export default function HomePage(){
   const [data,setData]=useState<Dashboard|null>(null),[loading,setLoading]=useState(true),[error,setError]=useState("");
@@ -71,7 +95,7 @@ export default function HomePage(){
           {project&&<ProjectDetail project={project} tab={tab} setTab={setTab} data={data} query={query} setQuery={setQuery} note={note} setNote={setNote} busy={busy} filteredFiles={filteredFiles} onDelete={()=>setDeleteOpen(true)}
             addNote={async()=>{if(note.trim()&&await action({action:"addNote",projectId:project.id,body:note},"Modification ajoutée"))setNote("")}}
             toggleNote={id=>action({action:"toggleNote",projectId:project.id,id})}
-            upload={async file=>{const form=new FormData();form.append("projectId",project.id);form.append("file",file,file.name);setBusy(true);try{const r=await fetch(new URL("/api/upload",window.location.origin),{method:"POST",body:form,credentials:"same-origin"});const text=await r.text();let body:{error?:string;id?:string}={};try{body=text?JSON.parse(text):{}}catch{body={error:text||`Erreur ${r.status}`}}if(!r.ok)throw new Error(body.error||`Erreur ${r.status}`);const extension=file.name.split(".").pop()?.toLowerCase();const isImage=file.type.startsWith("image/")||["heic","heif","jpg","jpeg","png","webp"].includes(extension||"");toast.success(isImage?"Photo enregistrée":"Document enregistré");await load(project.id)}catch(e){toast.error(e instanceof Error?e.message:"Téléchargement impossible")}finally{setBusy(false)}}}/>} 
+            upload={async file=>{setBusy(true);try{const preparedFile=await prepareUploadFile(file);const form=new FormData();form.append("projectId",project.id);form.append("file",preparedFile,preparedFile.name);const r=await fetch(new URL("/api/upload",window.location.origin),{method:"POST",body:form,credentials:"same-origin"});const text=await r.text();let body:{error?:string;id?:string}={};try{body=text?JSON.parse(text):{}}catch{body={error:text||`Erreur ${r.status}`}}if(!r.ok)throw new Error(body.error||`Erreur ${r.status}`);toast.success(isImageFile(preparedFile)?"Photo enregistrée":"Document enregistré");await load(project.id)}catch(e){toast.error(e instanceof Error?e.message:"Téléchargement impossible")}finally{setBusy(false)}}}/>} 
         </>}
       </main>
     </div>
