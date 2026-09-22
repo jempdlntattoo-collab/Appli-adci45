@@ -10,17 +10,25 @@ export async function GET(request:Request) {
       WHERE p.created_by=? OR m.user_id=? OR lower(m.email)=lower(?) ORDER BY p.created_at`).bind(user.userId,user.userId,user.email).all();
     const projects=projectsResult.results as Record<string,unknown>[];
     const projectId=(requested && projects.some(p=>p.id===requested) ? requested : projects[0]?.id) as string|undefined;
-    if(!projectId) return Response.json({user,projects:[],events:[],notes:[],files:[],members:[],activities:[],timer:null,canAdminProject:false});
-    const [events,notes,files,members,activities,timer]=await Promise.all([
+    if(!projectId) return Response.json({user,projects:[],events:[],notes:[],files:[],members:[],allMembers:[],activities:[],timer:null,canAdminProject:false});
+    const [events,notes,files,members,allMembers,eventMembers,activities,timer]=await Promise.all([
       DB.prepare("SELECT e.*,p.name project_name,p.address,p.color FROM events e JOIN projects p ON p.id=e.project_id WHERE e.project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?)) ORDER BY starts_at").bind(user.userId,user.userId,user.email).all(),
       DB.prepare("SELECT * FROM notes WHERE project_id=? ORDER BY created_at DESC").bind(projectId).all(),
       DB.prepare("SELECT id,name,content_type,size,kind,uploaded_by_name,created_at FROM files WHERE project_id=? ORDER BY created_at DESC").bind(projectId).all(),
       DB.prepare("SELECT id,display_name,email,role,status FROM project_members WHERE project_id=? ORDER BY created_at").bind(projectId).all(),
+      DB.prepare("SELECT id,project_id,display_name,email,role,status FROM project_members WHERE project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?)) ORDER BY display_name").bind(user.userId,user.userId,user.email).all(),
+      DB.prepare("SELECT em.event_id,pm.id member_id,pm.display_name FROM event_members em JOIN project_members pm ON pm.id=em.member_id JOIN events e ON e.id=em.event_id WHERE e.project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?)) ORDER BY pm.display_name").bind(user.userId,user.userId,user.email).all(),
       DB.prepare("SELECT * FROM activities WHERE project_id=? ORDER BY created_at DESC LIMIT 20").bind(projectId).all(),
       DB.prepare("SELECT * FROM time_entries WHERE user_id=? AND ends_at IS NULL ORDER BY starts_at DESC LIMIT 1").bind(user.userId).first(),
     ]);
+    const assignedByEvent=new Map<string,{id:string;display_name:string}[]>();
+    for(const row of eventMembers.results as Record<string,unknown>[]){
+      const eventId=String(row.event_id); const assigned=assignedByEvent.get(eventId)??[];
+      assigned.push({id:String(row.member_id),display_name:String(row.display_name)}); assignedByEvent.set(eventId,assigned);
+    }
+    const eventsWithMembers=(events.results as Record<string,unknown>[]).map(event=>({...event,assigned_members:assignedByEvent.get(String(event.id))??[]}));
     const isProjectAdmin=await canAdminProject(projectId,user.userId,user.email);
-    return Response.json({user,projects,selectedProjectId:projectId,events:events.results,notes:notes.results,files:files.results,members:members.results,activities:activities.results,timer,canAdminProject:isProjectAdmin});
+    return Response.json({user,projects,selectedProjectId:projectId,events:eventsWithMembers,notes:notes.results,files:files.results,members:members.results,allMembers:allMembers.results,activities:activities.results,timer,canAdminProject:isProjectAdmin});
   } catch(e) { if(e instanceof Response)return e; console.error(e); return Response.json({error:"Données temporairement indisponibles."},{status:500}); }
 }
 
@@ -73,8 +81,35 @@ export async function POST(request:Request) {
       await logActivity(projectId,user,"member_invited",`Invitation préparée pour ${email}`); return Response.json({ok:true});
     }
     if(body.action==="addEvent"){
-      const id=crypto.randomUUID(); await DB.prepare("INSERT INTO events (id,project_id,title,starts_at,ends_at,created_by,created_at) VALUES (?,?,?,?,?,?,?)").bind(id,projectId,String(body.title).slice(0,120),body.startsAt,body.endsAt,user.userId,now).run();
+      const id=crypto.randomUUID();
+      const requestedIds=Array.isArray(body.memberIds)?body.memberIds.map(String):[];
+      const validMembers=await DB.prepare("SELECT id FROM project_members WHERE project_id=?").bind(projectId).all<{id:string}>();
+      const allowed=new Set(validMembers.results.map(member=>member.id)); const memberIds=[...new Set(requestedIds.filter(id=>allowed.has(id)))];
+      await DB.batch([
+        DB.prepare("INSERT INTO events (id,project_id,title,starts_at,ends_at,created_by,created_at) VALUES (?,?,?,?,?,?,?)").bind(id,projectId,String(body.title).slice(0,120),body.startsAt,body.endsAt,user.userId,now),
+        ...memberIds.map(memberId=>DB.prepare("INSERT INTO event_members (event_id,member_id) VALUES (?,?)").bind(id,memberId)),
+      ]);
       await logActivity(projectId,user,"event_added",String(body.title).slice(0,120)); return Response.json({ok:true,id});
+    }
+    if(body.action==="updateEventMembers"){
+      const eventId=String(body.eventId||"");
+      const event=await DB.prepare("SELECT id FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first();
+      if(!event) return Response.json({error:"Intervention introuvable."},{status:404});
+      const requestedIds=Array.isArray(body.memberIds)?body.memberIds.map(String):[];
+      const validMembers=await DB.prepare("SELECT id FROM project_members WHERE project_id=?").bind(projectId).all<{id:string}>();
+      const allowed=new Set(validMembers.results.map(member=>member.id)); const memberIds=[...new Set(requestedIds.filter(id=>allowed.has(id)))];
+      await DB.batch([
+        DB.prepare("DELETE FROM event_members WHERE event_id=?").bind(eventId),
+        ...memberIds.map(memberId=>DB.prepare("INSERT INTO event_members (event_id,member_id) VALUES (?,?)").bind(eventId,memberId)),
+      ]);
+      await logActivity(projectId,user,"event_members_updated","Équipe de l’intervention modifiée"); return Response.json({ok:true});
+    }
+    if(body.action==="deleteEvent"){
+      const eventId=String(body.eventId||"");
+      const event=await DB.prepare("SELECT title FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first<{title:string}>();
+      if(!event) return Response.json({error:"Intervention introuvable."},{status:404});
+      await DB.prepare("DELETE FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).run();
+      await logActivity(projectId,user,"event_deleted",`Intervention supprimée · ${event.title}`); return Response.json({ok:true});
     }
     return Response.json({error:"Action inconnue"},{status:400});
   } catch(e) { if(e instanceof Response)return e; console.error(e); return Response.json({error:"Enregistrement impossible. Réessayez."},{status:500}); }
