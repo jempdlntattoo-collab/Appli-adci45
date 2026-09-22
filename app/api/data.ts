@@ -62,6 +62,14 @@ export function ensureSchema() {
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
       )`),
       DB.prepare("CREATE INDEX IF NOT EXISTS idx_events_project_start ON events (project_id, starts_at)"),
+      DB.prepare(`CREATE TABLE IF NOT EXISTS event_members (
+        event_id TEXT NOT NULL,
+        member_id TEXT NOT NULL,
+        PRIMARY KEY (event_id, member_id),
+        FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+        FOREIGN KEY (member_id) REFERENCES project_members(id) ON DELETE CASCADE
+      )`),
+      DB.prepare("CREATE INDEX IF NOT EXISTS idx_event_members_event ON event_members (event_id)"),
       DB.prepare(`CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY NOT NULL,
         project_id TEXT NOT NULL,
