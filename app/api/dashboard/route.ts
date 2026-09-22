@@ -143,6 +143,22 @@ export async function POST(request:Request) {
       ]);
       await logActivity(projectId,user,"event_members_updated","Équipe de l’intervention modifiée"); return Response.json({ok:true});
     }
+    if(body.action==="updateEvent"){
+      const eventId=String(body.eventId||"");
+      const event=await DB.prepare("SELECT id FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first();
+      if(!event) return Response.json({error:"Intervention introuvable."},{status:404});
+      const title=String(body.title||"").trim().slice(0,120); const startsAt=String(body.startsAt||""); const endsAt=String(body.endsAt||"");
+      if(!title||!Number.isFinite(Date.parse(startsAt))||!Number.isFinite(Date.parse(endsAt))||Date.parse(endsAt)<=Date.parse(startsAt)) return Response.json({error:"Vérifie la date et les horaires."},{status:400});
+      const requestedIds=Array.isArray(body.memberIds)?body.memberIds.map(String):[];
+      const validMembers=await DB.prepare("SELECT id FROM project_members WHERE project_id=?").bind(projectId).all<{id:string}>();
+      const allowed=new Set(validMembers.results.map(member=>member.id)); const memberIds=[...new Set(requestedIds.filter(id=>allowed.has(id)))];
+      await DB.batch([
+        DB.prepare("UPDATE events SET title=?,starts_at=?,ends_at=? WHERE id=? AND project_id=?").bind(title,startsAt,endsAt,eventId,projectId),
+        DB.prepare("DELETE FROM event_members WHERE event_id=?").bind(eventId),
+        ...memberIds.map(memberId=>DB.prepare("INSERT INTO event_members (event_id,member_id) VALUES (?,?)").bind(eventId,memberId)),
+      ]);
+      await logActivity(projectId,user,"event_updated",`Intervention modifiée · ${title}`); return Response.json({ok:true});
+    }
     if(body.action==="deleteEvent"){
       const eventId=String(body.eventId||"");
       const event=await DB.prepare("SELECT title FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first<{title:string}>();
