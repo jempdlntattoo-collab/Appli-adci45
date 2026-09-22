@@ -1,0 +1,62 @@
+import { canAccess, currentUser, DB, ensureSeed, logActivity } from "../data";
+
+export const dynamic = "force-dynamic";
+
+export async function GET(request:Request) {
+  try {
+    const user=await currentUser(request); await ensureSeed(user);
+    const requested=new URL(request.url).searchParams.get("project");
+    const projectsResult=await DB.prepare(`SELECT DISTINCT p.* FROM projects p LEFT JOIN project_members m ON m.project_id=p.id
+      WHERE p.created_by=? OR m.user_id=? OR lower(m.email)=lower(?) ORDER BY p.created_at`).bind(user.userId,user.userId,user.email).all();
+    const projects=projectsResult.results as Record<string,unknown>[];
+    const projectId=(requested && projects.some(p=>p.id===requested) ? requested : projects[0]?.id) as string|undefined;
+    if(!projectId) return Response.json({user,projects:[],events:[],notes:[],files:[],members:[],activities:[],timer:null});
+    const [events,notes,files,members,activities,timer]=await Promise.all([
+      DB.prepare("SELECT e.*,p.name project_name,p.address,p.color FROM events e JOIN projects p ON p.id=e.project_id WHERE e.project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?)) ORDER BY starts_at").bind(user.userId,user.userId,user.email).all(),
+      DB.prepare("SELECT * FROM notes WHERE project_id=? ORDER BY created_at DESC").bind(projectId).all(),
+      DB.prepare("SELECT id,name,content_type,size,kind,uploaded_by_name,created_at FROM files WHERE project_id=? ORDER BY created_at DESC").bind(projectId).all(),
+      DB.prepare("SELECT id,display_name,email,role,status FROM project_members WHERE project_id=? ORDER BY created_at").bind(projectId).all(),
+      DB.prepare("SELECT * FROM activities WHERE project_id=? ORDER BY created_at DESC LIMIT 20").bind(projectId).all(),
+      DB.prepare("SELECT * FROM time_entries WHERE user_id=? AND ends_at IS NULL ORDER BY starts_at DESC LIMIT 1").bind(user.userId).first(),
+    ]);
+    return Response.json({user,projects,selectedProjectId:projectId,events:events.results,notes:notes.results,files:files.results,members:members.results,activities:activities.results,timer});
+  } catch(e) { if(e instanceof Response)return e; console.error(e); return Response.json({error:"Données temporairement indisponibles."},{status:500}); }
+}
+
+export async function POST(request:Request) {
+  try {
+    const user=await currentUser(request); const body=await request.json() as Record<string,any>; const now=new Date().toISOString();
+    if(body.action==="createProject"){
+      const id=crypto.randomUUID();
+      await DB.batch([
+        DB.prepare("INSERT INTO projects (id,name,address,status,color,due_date,progress,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(id,String(body.name).slice(0,100),String(body.address||"").slice(0,200),"active","#3c73c9",body.dueDate||null,0,user.userId,now),
+        DB.prepare("INSERT INTO project_members (id,project_id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),id,user.userId,user.email,user.displayName,"admin","active",now),
+      ]); await logActivity(id,user,"project_created","Chantier créé"); return Response.json({ok:true,id});
+    }
+    const projectId=String(body.projectId||""); if(!await canAccess(projectId,user.userId,user.email)) return new Response("Accès refusé",{status:403});
+    if(body.action==="addNote"){
+      const id=crypto.randomUUID(); await DB.prepare("INSERT INTO notes (id,project_id,body,done,author_id,author_name,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").bind(id,projectId,String(body.body).slice(0,1000),0,user.userId,user.displayName,now,now).run();
+      await logActivity(projectId,user,"note_added","Modification ajoutée"); return Response.json({ok:true,id});
+    }
+    if(body.action==="toggleNote"){
+      await DB.prepare("UPDATE notes SET done=CASE done WHEN 1 THEN 0 ELSE 1 END, updated_at=? WHERE id=? AND project_id=?").bind(now,String(body.id),projectId).run();
+      await logActivity(projectId,user,"note_updated","Statut d’une modification changé"); return Response.json({ok:true});
+    }
+    if(body.action==="timer"){
+      const running=await DB.prepare("SELECT * FROM time_entries WHERE user_id=? AND ends_at IS NULL LIMIT 1").bind(user.userId).first<Record<string,any>>();
+      if(running){ const seconds=Math.max(0,Math.floor((Date.now()-Date.parse(running.starts_at))/1000)); await DB.prepare("UPDATE time_entries SET ends_at=?,duration_seconds=? WHERE id=?").bind(now,seconds,running.id).run(); await logActivity(String(running.project_id),user,"timer_stopped",`Pointage arrêté · ${Math.floor(seconds/60)} min`); }
+      else { await DB.prepare("INSERT INTO time_entries (id,project_id,user_id,user_name,starts_at,ends_at,duration_seconds,created_at) VALUES (?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),projectId,user.userId,user.displayName,now,null,0,now).run(); await logActivity(projectId,user,"timer_started","Pointage démarré"); }
+      return Response.json({ok:true});
+    }
+    if(body.action==="invite"){
+      const email=String(body.email||"").trim().toLowerCase(); if(!email.includes("@")) return Response.json({error:"Adresse e-mail invalide"},{status:400});
+      await DB.prepare("INSERT INTO project_members (id,project_id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(project_id,email) DO UPDATE SET status='invited', role=excluded.role").bind(crypto.randomUUID(),projectId,null,email,String(body.name||email.split("@")[0]).slice(0,80),String(body.role||"member"),"invited",now).run();
+      await logActivity(projectId,user,"member_invited",`Invitation préparée pour ${email}`); return Response.json({ok:true});
+    }
+    if(body.action==="addEvent"){
+      const id=crypto.randomUUID(); await DB.prepare("INSERT INTO events (id,project_id,title,starts_at,ends_at,created_by,created_at) VALUES (?,?,?,?,?,?,?)").bind(id,projectId,String(body.title).slice(0,120),body.startsAt,body.endsAt,user.userId,now).run();
+      await logActivity(projectId,user,"event_added",String(body.title).slice(0,120)); return Response.json({ok:true,id});
+    }
+    return Response.json({error:"Action inconnue"},{status:400});
+  } catch(e) { if(e instanceof Response)return e; console.error(e); return Response.json({error:"Enregistrement impossible. Réessayez."},{status:500}); }
+}
