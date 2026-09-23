@@ -65,7 +65,8 @@ export default function HomePage(){
   const elapsed=data?.timer?Math.max(0,Math.floor((Date.now()-Date.parse(data.timer.starts_at))/1000)):0; void tick;
   const timeText=[Math.floor(elapsed/3600),Math.floor(elapsed%3600/60),elapsed%60].map(n=>String(n).padStart(2,"0")).join(":");
   const todayEvents=data?.events.filter(event=>dateKey(event.starts_at)===dateKey(new Date()))??[];
-  const sectionTitle={accueil:`Bonjour ${data.user.displayName.split(" ")[0]} 👋`,agenda:"Agenda",chantiers:"Chantiers",temps:"Temps de travail",equipe:"Équipe"}[section]||section;
+  const firstName=data?.user.displayName.split(" ")[0]??"";
+  const sectionTitle={accueil:firstName?`Bonjour ${firstName} 👋`:"Bonjour 👋",agenda:"Agenda",chantiers:"Chantiers",temps:"Temps de travail",equipe:"Équipe"}[section]||section;
   const sectionDescription={accueil:"Voici ce qui est prévu aujourd’hui.",agenda:"Les interventions, journée par journée.",chantiers:"Tous les chantiers de l’entreprise.",temps:"Démarrez ou arrêtez votre pointage.",equipe:"Les membres et leurs autorisations."}[section]||"";
 
   if(loading&&!data)return <State icon={<Loader2 className="animate-spin"/>} title="Chargement des chantiers…"/>;
