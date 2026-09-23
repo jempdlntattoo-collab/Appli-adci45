@@ -30,6 +30,7 @@ export function ensureSchema() {
         user_id TEXT,
         email TEXT,
         display_name TEXT NOT NULL,
+        phone TEXT,
         role TEXT DEFAULT 'member' NOT NULL,
         status TEXT DEFAULT 'active' NOT NULL,
         avatar_key TEXT,
@@ -133,7 +134,10 @@ export function ensureSchema() {
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
       )`),
       DB.prepare("CREATE INDEX IF NOT EXISTS idx_activity_project_created ON activities (project_id, created_at)"),
-    ]).then(() => undefined).catch((error) => {
+    ]).then(async () => {
+      const columns=await DB.prepare("PRAGMA table_info(company_members)").all<{name:string}>();
+      if(!columns.results.some(column=>column.name==="phone")) await DB.prepare("ALTER TABLE company_members ADD COLUMN phone TEXT").run();
+    }).catch((error) => {
       schemaReady = undefined;
       throw error;
     });
@@ -162,7 +166,7 @@ export async function currentUser(request: Request) {
     ON CONFLICT(id) DO UPDATE SET email=excluded.email, display_name=excluded.display_name`)
     .bind(user.userId, user.email, user.displayName, now).run();
   await DB.prepare(`INSERT INTO company_members (id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?)
-    ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, email=excluded.email, display_name=excluded.display_name, status='active'`)
+    ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, email=excluded.email, status='active'`)
     .bind(`email:${user.email.toLowerCase()}`,user.userId,user.email.toLowerCase(),user.displayName,"member","active",now).run();
   return user;
 }
