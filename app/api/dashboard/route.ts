@@ -18,8 +18,8 @@ export async function GET(request:Request) {
           FROM company_members cm JOIN project_members pm ON (lower(pm.email)=lower(cm.email) OR pm.user_id=cm.user_id OR cm.id='member:'||pm.id)
           WHERE pm.project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?))
           ORDER BY cm.display_name`).bind(user.userId,user.userId,user.email).all();
-    if(!projectId) return Response.json({user,projects:[],events:[],notes:[],files:[],members:[],allMembers:[],companyMembers:companyMembers.results,activities:[],timer:null,canAdminProject:false,canAdminCompany:isCompanyAdmin});
-    const [events,notes,files,members,allMembers,eventMembers,activities,timer]=await Promise.all([
+    if(!projectId) return Response.json({user,projects:[],events:[],notes:[],files:[],members:[],allMembers:[],companyMembers:companyMembers.results,activities:[],timer:null,projectTimes:[],canAdminProject:false,canAdminCompany:isCompanyAdmin});
+    const [events,notes,files,members,allMembers,eventMembers,activities,timer,projectTimes]=await Promise.all([
       DB.prepare("SELECT e.*,p.name project_name,p.address,p.color FROM events e JOIN projects p ON p.id=e.project_id WHERE e.project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?)) ORDER BY starts_at").bind(user.userId,user.userId,user.email).all(),
       DB.prepare("SELECT * FROM notes WHERE project_id=? ORDER BY created_at DESC").bind(projectId).all(),
       DB.prepare("SELECT id,name,content_type,size,kind,uploaded_by_name,created_at FROM files WHERE project_id=? ORDER BY created_at DESC").bind(projectId).all(),
@@ -28,6 +28,7 @@ export async function GET(request:Request) {
       DB.prepare("SELECT em.event_id,pm.id member_id,pm.display_name FROM event_members em JOIN project_members pm ON pm.id=em.member_id JOIN events e ON e.id=em.event_id WHERE e.project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?)) ORDER BY pm.display_name").bind(user.userId,user.userId,user.email).all(),
       DB.prepare("SELECT * FROM activities WHERE project_id=? ORDER BY created_at DESC LIMIT 20").bind(projectId).all(),
       DB.prepare("SELECT * FROM time_entries WHERE user_id=? AND ends_at IS NULL ORDER BY starts_at DESC LIMIT 1").bind(user.userId).first(),
+      DB.prepare("SELECT project_id,COALESCE(SUM(duration_seconds),0) total_seconds FROM time_entries WHERE user_id=? GROUP BY project_id").bind(user.userId).all(),
     ]);
     const assignedByEvent=new Map<string,{id:string;display_name:string}[]>();
     for(const row of eventMembers.results as Record<string,unknown>[]){
@@ -36,7 +37,7 @@ export async function GET(request:Request) {
     }
     const eventsWithMembers=(events.results as Record<string,unknown>[]).map(event=>({...event,assigned_members:assignedByEvent.get(String(event.id))??[]}));
     const isProjectAdmin=await canAdminProject(projectId,user.userId,user.email);
-    return Response.json({user,projects,selectedProjectId:projectId,events:eventsWithMembers,notes:notes.results,files:files.results,members:members.results,allMembers:allMembers.results,companyMembers:companyMembers.results,activities:activities.results,timer,canAdminProject:isProjectAdmin,canAdminCompany:isCompanyAdmin});
+    return Response.json({user,projects,selectedProjectId:projectId,events:eventsWithMembers,notes:notes.results,files:files.results,members:members.results,allMembers:allMembers.results,companyMembers:companyMembers.results,activities:activities.results,timer,projectTimes:projectTimes.results,canAdminProject:isProjectAdmin,canAdminCompany:isCompanyAdmin});
   } catch(e) { if(e instanceof Response)return e; console.error(e); return Response.json({error:"Données temporairement indisponibles."},{status:500}); }
 }
 
@@ -131,8 +132,14 @@ export async function POST(request:Request) {
     }
     if(body.action==="timer"){
       const running=await DB.prepare("SELECT * FROM time_entries WHERE user_id=? AND ends_at IS NULL LIMIT 1").bind(user.userId).first<Record<string,any>>();
-      if(running){ const seconds=Math.max(0,Math.floor((Date.now()-Date.parse(running.starts_at))/1000)); await DB.prepare("UPDATE time_entries SET ends_at=?,duration_seconds=? WHERE id=?").bind(now,seconds,running.id).run(); await logActivity(String(running.project_id),user,"timer_stopped",`Pointage arrêté · ${Math.floor(seconds/60)} min`); }
-      else { await DB.prepare("INSERT INTO time_entries (id,project_id,user_id,user_name,starts_at,ends_at,duration_seconds,created_at) VALUES (?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),projectId,user.userId,user.displayName,now,null,0,now).run(); await logActivity(projectId,user,"timer_started","Pointage démarré"); }
+      if(running){
+        const seconds=Math.max(0,Math.floor((Date.now()-Date.parse(running.starts_at))/1000));
+        await DB.prepare("UPDATE time_entries SET ends_at=?,duration_seconds=? WHERE id=?").bind(now,seconds,running.id).run();
+        await logActivity(String(running.project_id),user,"timer_stopped",`Pointage arrêté · ${Math.floor(seconds/60)} min`);
+        if(String(running.project_id)===projectId) return Response.json({ok:true});
+      }
+      await DB.prepare("INSERT INTO time_entries (id,project_id,user_id,user_name,starts_at,ends_at,duration_seconds,created_at) VALUES (?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),projectId,user.userId,user.displayName,now,null,0,now).run();
+      await logActivity(projectId,user,"timer_started","Pointage démarré");
       return Response.json({ok:true});
     }
     if(body.action==="invite"){
