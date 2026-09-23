@@ -1,4 +1,5 @@
 import { BUCKET, canAccess, canAdminCompany, canAdminProject, currentUser, DB, ensureSeed, logActivity, syncCompanyMembers } from "../data";
+import { clerkClient } from "@clerk/nextjs/server";
 
 export const dynamic = "force-dynamic";
 
@@ -112,12 +113,25 @@ export async function POST(request:Request) {
       if(!await canAdminProject(projectId,user.userId,user.email)) return Response.json({error:"Seul un administrateur peut inviter et choisir les rôles."},{status:403});
       const email=String(body.email||"").trim().toLowerCase(); if(!email.includes("@")) return Response.json({error:"Adresse e-mail invalide"},{status:400});
       const displayName=String(body.name||email.split("@")[0]).slice(0,80); const role=body.role==="admin"?"admin":"member";
+      try {
+        const client=await clerkClient();
+        await client.invitations.createInvitation({
+          emailAddress:email,
+          notify:true,
+          ignoreExisting:true,
+          redirectUrl:new URL("/sign-up",request.url).toString(),
+          publicMetadata:{displayName,role},
+        });
+      } catch(error) {
+        console.error("[dashboard/invite] Clerk invitation failed",{email,error:String(error)});
+        return Response.json({error:"L’e-mail d’invitation n’a pas pu être envoyé. Vérifie l’adresse puis réessaie."},{status:502});
+      }
       await DB.batch([
         DB.prepare("INSERT INTO project_members (id,project_id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(project_id,email) DO UPDATE SET status='invited', role=excluded.role").bind(crypto.randomUUID(),projectId,null,email,displayName,role,"invited",now),
         DB.prepare(`INSERT INTO company_members (id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?)
           ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,role=excluded.role,status=excluded.status`).bind(`email:${email}`,null,email,displayName,role,"invited",now),
       ]);
-      await logActivity(projectId,user,"member_invited",`Invitation préparée pour ${email}`); return Response.json({ok:true});
+      await logActivity(projectId,user,"member_invited",`Invitation envoyée à ${email}`); return Response.json({ok:true});
     }
     if(body.action==="addExistingMembers"){
       if(!await canAdminProject(projectId,user.userId,user.email)) return Response.json({error:"Seul un administrateur peut ajouter des membres."},{status:403});
