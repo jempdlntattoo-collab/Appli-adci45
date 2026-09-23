@@ -13,8 +13,8 @@ export async function GET(request:Request) {
     const projectId=(requested && projects.some(p=>p.id===requested) ? requested : projects[0]?.id) as string|undefined;
     const isCompanyAdmin=await canAdminCompany(user.userId,user.email);
     const companyMembers=isCompanyAdmin
-      ? await DB.prepare("SELECT id,user_id,email,display_name,role,status,avatar_key IS NOT NULL has_avatar,avatar_key avatar_version FROM company_members ORDER BY display_name").all()
-      : await DB.prepare(`SELECT DISTINCT cm.id,cm.user_id,cm.email,cm.display_name,cm.role,cm.status,cm.avatar_key IS NOT NULL has_avatar,cm.avatar_key avatar_version
+      ? await DB.prepare("SELECT id,user_id,email,display_name,phone,role,status,avatar_key IS NOT NULL has_avatar,avatar_key avatar_version FROM company_members ORDER BY display_name").all()
+      : await DB.prepare(`SELECT DISTINCT cm.id,cm.user_id,cm.email,cm.display_name,cm.phone,cm.role,cm.status,cm.avatar_key IS NOT NULL has_avatar,cm.avatar_key avatar_version
           FROM company_members cm JOIN project_members pm ON (lower(pm.email)=lower(cm.email) OR pm.user_id=cm.user_id OR cm.id='member:'||pm.id)
           WHERE pm.project_id IN (SELECT id FROM projects WHERE created_by=? UNION SELECT project_id FROM project_members WHERE user_id=? OR lower(email)=lower(?))
           ORDER BY cm.display_name`).bind(user.userId,user.userId,user.email).all();
@@ -81,6 +81,32 @@ export async function POST(request:Request) {
       ]);
       return Response.json({ok:true});
     }
+    if(body.action==="updateCompanyMember"){
+      if(!await canAdminCompany(user.userId,user.email)) return Response.json({error:"Seul un administrateur peut modifier les profils."},{status:403});
+      const memberId=String(body.memberId||"");
+      const member=await DB.prepare("SELECT * FROM company_members WHERE id=?").bind(memberId).first<Record<string,any>>();
+      if(!member) return Response.json({error:"Membre introuvable."},{status:404});
+      const displayName=String(body.displayName||"").trim().slice(0,80);
+      const phone=String(body.phone||"").trim().slice(0,30)||null;
+      const requestedEmail=String(body.email||"").trim().toLowerCase();
+      if(!displayName) return Response.json({error:"Le nom est obligatoire."},{status:400});
+      if(!member.user_id&&!requestedEmail.includes("@")) return Response.json({error:"Adresse e-mail invalide."},{status:400});
+      const oldEmail=String(member.email||"").toLowerCase();
+      const email=member.user_id?oldEmail:requestedEmail;
+      const newMemberId=!member.user_id&&memberId.startsWith("email:")?`email:${email}`:memberId;
+      try {
+        await DB.batch([
+          DB.prepare("UPDATE company_members SET id=?,email=?,display_name=?,phone=? WHERE id=?").bind(newMemberId,email||null,displayName,phone,memberId),
+          member.user_id
+            ? DB.prepare("UPDATE project_members SET display_name=? WHERE user_id=? OR (email IS NOT NULL AND lower(email)=lower(?))").bind(displayName,member.user_id,oldEmail)
+            : DB.prepare("UPDATE project_members SET email=?,display_name=? WHERE (email IS NOT NULL AND lower(email)=lower(?)) OR ('member:'||id)=?").bind(email,displayName,oldEmail,memberId),
+        ]);
+      } catch(error) {
+        console.error("[dashboard/member] Profile update failed",{memberId,error:String(error)});
+        return Response.json({error:"Ce nom ou cette adresse e-mail est déjà utilisé."},{status:409});
+      }
+      return Response.json({ok:true});
+    }
     if(body.action==="deleteCompanyMember"){
       if(!await canAdminCompany(user.userId,user.email)) return Response.json({error:"Seul un administrateur peut supprimer un membre."},{status:403});
       const memberId=String(body.memberId||"");
@@ -112,7 +138,7 @@ export async function POST(request:Request) {
     if(body.action==="invite"){
       if(!await canAdminProject(projectId,user.userId,user.email)) return Response.json({error:"Seul un administrateur peut inviter et choisir les rôles."},{status:403});
       const email=String(body.email||"").trim().toLowerCase(); if(!email.includes("@")) return Response.json({error:"Adresse e-mail invalide"},{status:400});
-      const displayName=String(body.name||email.split("@")[0]).slice(0,80); const role=body.role==="admin"?"admin":"member";
+      const displayName=String(body.name||email.split("@")[0]).slice(0,80); const role=body.role==="admin"?"admin":"member"; const phone=String(body.phone||"").trim().slice(0,30)||null;
       try {
         const client=await clerkClient();
         await client.invitations.createInvitation({
@@ -128,8 +154,8 @@ export async function POST(request:Request) {
       }
       await DB.batch([
         DB.prepare("INSERT INTO project_members (id,project_id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(project_id,email) DO UPDATE SET status='invited', role=excluded.role").bind(crypto.randomUUID(),projectId,null,email,displayName,role,"invited",now),
-        DB.prepare(`INSERT INTO company_members (id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?)
-          ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,role=excluded.role,status=excluded.status`).bind(`email:${email}`,null,email,displayName,role,"invited",now),
+        DB.prepare(`INSERT INTO company_members (id,user_id,email,display_name,phone,role,status,created_at) VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,phone=excluded.phone,role=excluded.role,status=excluded.status`).bind(`email:${email}`,null,email,displayName,phone,role,"invited",now),
       ]);
       await logActivity(projectId,user,"member_invited",`Invitation envoyée à ${email}`); return Response.json({ok:true});
     }
