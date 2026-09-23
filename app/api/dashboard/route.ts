@@ -119,6 +119,20 @@ export async function POST(request:Request) {
       ]);
       await logActivity(projectId,user,"member_invited",`Invitation préparée pour ${email}`); return Response.json({ok:true});
     }
+    if(body.action==="addExistingMembers"){
+      if(!await canAdminProject(projectId,user.userId,user.email)) return Response.json({error:"Seul un administrateur peut ajouter des membres."},{status:403});
+      const requestedIds=Array.isArray(body.memberIds)?[...new Set(body.memberIds.map(String))]:[];
+      if(!requestedIds.length) return Response.json({error:"Sélectionne au moins une personne."},{status:400});
+      const inserts=[];
+      for(const memberId of requestedIds){
+        const member=await DB.prepare("SELECT * FROM company_members WHERE id=?").bind(memberId).first<Record<string,any>>();
+        if(!member)continue;
+        const exists=await DB.prepare(`SELECT id FROM project_members WHERE project_id=? AND ((email IS NOT NULL AND lower(email)=lower(?)) OR (user_id IS NOT NULL AND user_id=?) OR ('member:'||id)=?) LIMIT 1`).bind(projectId,member.email||"",member.user_id||"",memberId).first();
+        if(!exists)inserts.push(DB.prepare("INSERT INTO project_members (id,project_id,user_id,email,display_name,role,status,created_at) VALUES (?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(),projectId,member.user_id||null,member.email||null,member.display_name,member.role,member.status,now));
+      }
+      if(inserts.length)await DB.batch(inserts);
+      await logActivity(projectId,user,"members_added",`${inserts.length} membre${inserts.length>1?"s":""} ajouté${inserts.length>1?"s":""} au chantier`); return Response.json({ok:true});
+    }
     if(body.action==="addEvent"){
       const id=crypto.randomUUID();
       const requestedIds=Array.isArray(body.memberIds)?body.memberIds.map(String):[];
