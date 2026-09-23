@@ -19,7 +19,6 @@ export default clerkMiddleware(async (auth, request) => {
 
 export const config = {
   matcher: [
-    "/",
     "/(api|trpc)(.*)",
     "/__clerk/:path*",
     "/sign-in/:path*",
