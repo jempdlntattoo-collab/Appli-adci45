@@ -1,10 +1,19 @@
-import { clerkMiddleware } from "@clerk/nextjs/server";
+import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
+
+const isPublicRoute = createRouteMatcher(["/sign-in(.*)", "/sign-up(.*)"]);
+const isApiRoute = createRouteMatcher(["/api(.*)", "/trpc(.*)"]);
 
 export default clerkMiddleware(async (auth, request) => {
-  const pathname = request.nextUrl.pathname;
-  const isPublicRoute = pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up");
+  if (isPublicRoute(request)) return;
 
-  if (!isPublicRoute) await auth.protect();
+  const { userId } = await auth();
+  if (userId) return;
+
+  if (isApiRoute(request)) {
+    return Response.json({ error: "Non autorisé" }, { status: 401 });
+  }
+
+  return Response.redirect(new URL("/sign-in", request.url), 302);
 });
 
 export const config = {
