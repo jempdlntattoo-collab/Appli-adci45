@@ -17,7 +17,7 @@ export class CalendarError extends Error {
 }
 
 async function googleToken(userId: string): Promise<string> {
-  const response = await (await clerkClient()).users.getUserOauthAccessToken(userId, "oauth_google");
+  const response = await (await clerkClient()).users.getUserOauthAccessToken(userId, "google");
   const grant = response.data.find(item => item.scopes?.some(value => value === scope || value === "https://www.googleapis.com/auth/calendar"));
   if (!grant) throw new CalendarError("Connectez votre compte Google et autorisez l'accès aux événements de votre agenda avant d'envoyer cette intervention.", 409);
   return grant.token;
