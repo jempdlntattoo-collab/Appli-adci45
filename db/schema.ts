@@ -21,6 +21,8 @@ export const events = sqliteTable("events", {
   id: text("id").primaryKey(), projectId: text("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
   title: text("title").notNull(), startsAt: text("starts_at").notNull(), endsAt: text("ends_at").notNull(),
   createdBy: text("created_by").notNull(), createdAt: text("created_at").notNull(),
+  shareToGoogle: integer("share_to_google", { mode: "boolean" }).notNull().default(false),
+  googleEventId: text("google_event_id"), googleOrganizerUserId: text("google_organizer_user_id"),
 }, (t) => [index("idx_events_project_start").on(t.projectId, t.startsAt)]);
 
 export const notes = sqliteTable("notes", {
