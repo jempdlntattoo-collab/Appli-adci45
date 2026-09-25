@@ -72,6 +72,9 @@ export function ensureSchema() {
         ends_at TEXT NOT NULL,
         created_by TEXT NOT NULL,
         created_at TEXT NOT NULL,
+        share_to_google INTEGER NOT NULL DEFAULT 0,
+        google_event_id TEXT,
+        google_organizer_user_id TEXT,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
       )`),
       DB.prepare("CREATE INDEX IF NOT EXISTS idx_events_project_start ON events (project_id, starts_at)"),
@@ -137,6 +140,10 @@ export function ensureSchema() {
     ]).then(async () => {
       const columns=await DB.prepare("PRAGMA table_info(company_members)").all<{name:string}>();
       if(!columns.results.some(column=>column.name==="phone")) await DB.prepare("ALTER TABLE company_members ADD COLUMN phone TEXT").run();
+      const eventColumns=await DB.prepare("PRAGMA table_info(events)").all<{name:string}>();
+      if(!eventColumns.results.some(column=>column.name==="share_to_google")) await DB.prepare("ALTER TABLE events ADD COLUMN share_to_google INTEGER NOT NULL DEFAULT 0").run();
+      if(!eventColumns.results.some(column=>column.name==="google_event_id")) await DB.prepare("ALTER TABLE events ADD COLUMN google_event_id TEXT").run();
+      if(!eventColumns.results.some(column=>column.name==="google_organizer_user_id")) await DB.prepare("ALTER TABLE events ADD COLUMN google_organizer_user_id TEXT").run();
     }).catch((error) => {
       schemaReady = undefined;
       throw error;

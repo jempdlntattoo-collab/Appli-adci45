@@ -1,7 +1,26 @@
 import { BUCKET, canAccess, canAdminCompany, canAdminProject, currentUser, DB, ensureSeed, logActivity, syncCompanyMembers } from "../data";
 import { clerkClient } from "@clerk/nextjs/server";
+import { CalendarError, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent, type CalendarIntervention } from "../google-calendar";
 
 export const dynamic = "force-dynamic";
+
+async function assignedMembers(projectId:string, requested:unknown) {
+  const ids=Array.isArray(requested)?[...new Set(requested.map(String))]:[];
+  const rows=await DB.prepare("SELECT id,email FROM project_members WHERE project_id=?").bind(projectId).all<{id:string;email:string|null}>();
+  const byId=new Map(rows.results.map(member=>[member.id,member]));
+  return ids.map(id=>byId.get(id)).filter((member):member is {id:string;email:string|null}=>Boolean(member));
+}
+
+async function calendarDetails(projectId:string, title:string, startsAt:string, endsAt:string, members:{id:string;email:string|null}[]):Promise<CalendarIntervention> {
+  if(!members.length) throw new CalendarError("Sélectionnez au moins une personne concernée pour envoyer l'invitation.");
+  const missing=members.some(member=>!member.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(member.email));
+  if(missing) throw new CalendarError("Chaque personne concernée doit avoir une adresse e-mail valide pour recevoir l'invitation.");
+  const project=await DB.prepare("SELECT name,address FROM projects WHERE id=?").bind(projectId).first<{name:string;address:string}>();
+  if(!project) throw new CalendarError("Chantier introuvable.",404);
+  const emails=[...new Set(members.map(member=>member.email!.trim().toLowerCase()))];
+  return {projectName:project.name,address:project.address,title,startsAt,endsAt,attendeeEmails:emails};
+}
+
 
 export async function GET(request:Request) {
   try {
@@ -54,6 +73,8 @@ export async function POST(request:Request) {
     const projectId=String(body.projectId||""); if(!await canAccess(projectId,user.userId,user.email)) return new Response("Accès refusé",{status:403});
     if(body.action==="deleteProject"){
       if(!await canAdminProject(projectId,user.userId,user.email)) return Response.json({error:"Seul un administrateur peut supprimer ce chantier."},{status:403});
+      const shared=await DB.prepare("SELECT google_event_id,google_organizer_user_id FROM events WHERE project_id=? AND google_event_id IS NOT NULL").bind(projectId).all<{google_event_id:string;google_organizer_user_id:string|null}>();
+      for(const event of shared.results) await deleteCalendarEvent(event.google_organizer_user_id||user.userId,event.google_event_id);
       const files=await DB.prepare("SELECT object_key FROM files WHERE project_id=?").bind(projectId).all<{object_key:string}>();
       await Promise.all(files.results.map(file=>BUCKET.delete(file.object_key)));
       await DB.prepare("DELETE FROM projects WHERE id=?").bind(projectId).run();
@@ -181,20 +202,29 @@ export async function POST(request:Request) {
       await logActivity(projectId,user,"members_added",`${inserts.length} membre${inserts.length>1?"s":""} ajouté${inserts.length>1?"s":""} au chantier`); return Response.json({ok:true});
     }
     if(body.action==="addEvent"){
+      const title=String(body.title||"").trim().slice(0,120),startsAt=String(body.startsAt||""),endsAt=String(body.endsAt||"");
+      if(!title||!Number.isFinite(Date.parse(startsAt))||!Number.isFinite(Date.parse(endsAt))||Date.parse(endsAt)<=Date.parse(startsAt)) return Response.json({error:"Vérifie la date et les horaires."},{status:400});
+      const members=await assignedMembers(projectId,body.memberIds), share=body.shareToGoogle===true;
+      const calendar=share?await calendarDetails(projectId,title,startsAt,endsAt,members):null;
+      // Send only after the user has ticked the explicit Google Agenda option.
+      const googleId=calendar?await createCalendarEvent(user.userId,calendar):null;
       const id=crypto.randomUUID();
-      const requestedIds=Array.isArray(body.memberIds)?body.memberIds.map(String):[];
-      const validMembers=await DB.prepare("SELECT id FROM project_members WHERE project_id=?").bind(projectId).all<{id:string}>();
-      const allowed=new Set(validMembers.results.map(member=>member.id)); const memberIds=[...new Set(requestedIds.filter(id=>allowed.has(id)))];
-      await DB.batch([
-        DB.prepare("INSERT INTO events (id,project_id,title,starts_at,ends_at,created_by,created_at) VALUES (?,?,?,?,?,?,?)").bind(id,projectId,String(body.title).slice(0,120),body.startsAt,body.endsAt,user.userId,now),
-        ...memberIds.map(memberId=>DB.prepare("INSERT INTO event_members (event_id,member_id) VALUES (?,?)").bind(id,memberId)),
-      ]);
-      await logActivity(projectId,user,"event_added",String(body.title).slice(0,120)); return Response.json({ok:true,id});
+      try {
+        await DB.batch([
+          DB.prepare("INSERT INTO events (id,project_id,title,starts_at,ends_at,created_by,created_at,share_to_google,google_event_id,google_organizer_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(id,projectId,title,startsAt,endsAt,user.userId,now,share?1:0,googleId,googleId?user.userId:null),
+          ...members.map(member=>DB.prepare("INSERT INTO event_members (event_id,member_id) VALUES (?,?)").bind(id,member.id)),
+        ]);
+      } catch(error) {
+        if(googleId) try { await deleteCalendarEvent(user.userId,googleId); } catch(cleanupError) { console.error("Google Agenda cleanup failed",cleanupError); }
+        throw error;
+      }
+      await logActivity(projectId,user,"event_added",title); return Response.json({ok:true,id});
     }
     if(body.action==="updateEventMembers"){
       const eventId=String(body.eventId||"");
-      const event=await DB.prepare("SELECT id FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first();
+      const event=await DB.prepare("SELECT id,share_to_google FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first();
       if(!event) return Response.json({error:"Intervention introuvable."},{status:404});
+      if(event.share_to_google) return Response.json({error:"Modifiez l’intervention depuis l’agenda pour mettre à jour les invitations Google."},{status:409});
       const requestedIds=Array.isArray(body.memberIds)?body.memberIds.map(String):[];
       const validMembers=await DB.prepare("SELECT id FROM project_members WHERE project_id=?").bind(projectId).all<{id:string}>();
       const allowed=new Set(validMembers.results.map(member=>member.id)); const memberIds=[...new Set(requestedIds.filter(id=>allowed.has(id)))];
@@ -206,27 +236,37 @@ export async function POST(request:Request) {
     }
     if(body.action==="updateEvent"){
       const eventId=String(body.eventId||"");
-      const event=await DB.prepare("SELECT id FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first();
+      const event=await DB.prepare("SELECT * FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first<{id:string;title:string;starts_at:string;ends_at:string;share_to_google:number;google_event_id:string|null;google_organizer_user_id:string|null}>();
       if(!event) return Response.json({error:"Intervention introuvable."},{status:404});
-      const title=String(body.title||"").trim().slice(0,120); const startsAt=String(body.startsAt||""); const endsAt=String(body.endsAt||"");
+      const title=String(body.title||"").trim().slice(0,120),startsAt=String(body.startsAt||""),endsAt=String(body.endsAt||"");
       if(!title||!Number.isFinite(Date.parse(startsAt))||!Number.isFinite(Date.parse(endsAt))||Date.parse(endsAt)<=Date.parse(startsAt)) return Response.json({error:"Vérifie la date et les horaires."},{status:400});
-      const requestedIds=Array.isArray(body.memberIds)?body.memberIds.map(String):[];
-      const validMembers=await DB.prepare("SELECT id FROM project_members WHERE project_id=?").bind(projectId).all<{id:string}>();
-      const allowed=new Set(validMembers.results.map(member=>member.id)); const memberIds=[...new Set(requestedIds.filter(id=>allowed.has(id)))];
-      await DB.batch([
-        DB.prepare("UPDATE events SET title=?,starts_at=?,ends_at=? WHERE id=? AND project_id=?").bind(title,startsAt,endsAt,eventId,projectId),
-        DB.prepare("DELETE FROM event_members WHERE event_id=?").bind(eventId),
-        ...memberIds.map(memberId=>DB.prepare("INSERT INTO event_members (event_id,member_id) VALUES (?,?)").bind(eventId,memberId)),
-      ]);
+      const members=await assignedMembers(projectId,body.memberIds),share=body.shareToGoogle===true;
+      const calendar=share?await calendarDetails(projectId,title,startsAt,endsAt,members):null;
+      const organizer=event.google_organizer_user_id||user.userId;
+      let googleId=event.google_event_id, newGoogleId:string|null=null;
+      if(calendar && googleId) await updateCalendarEvent(organizer,googleId,calendar);
+      else if(calendar) { newGoogleId=await createCalendarEvent(user.userId,calendar); googleId=newGoogleId; }
+      else if(googleId) { await deleteCalendarEvent(organizer,googleId); googleId=null; }
+      try {
+        await DB.batch([
+          DB.prepare("UPDATE events SET title=?,starts_at=?,ends_at=?,share_to_google=?,google_event_id=?,google_organizer_user_id=? WHERE id=? AND project_id=?").bind(title,startsAt,endsAt,share?1:0,googleId,googleId?(newGoogleId?user.userId:organizer):null,eventId,projectId),
+          DB.prepare("DELETE FROM event_members WHERE event_id=?").bind(eventId),
+          ...members.map(member=>DB.prepare("INSERT INTO event_members (event_id,member_id) VALUES (?,?)").bind(eventId,member.id)),
+        ]);
+      } catch(error) {
+        if(newGoogleId) try { await deleteCalendarEvent(user.userId,newGoogleId); } catch(cleanupError) { console.error("Google Agenda cleanup failed",cleanupError); }
+        throw error;
+      }
       await logActivity(projectId,user,"event_updated",`Intervention modifiée · ${title}`); return Response.json({ok:true});
     }
     if(body.action==="deleteEvent"){
       const eventId=String(body.eventId||"");
-      const event=await DB.prepare("SELECT title FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first<{title:string}>();
+      const event=await DB.prepare("SELECT title,google_event_id,google_organizer_user_id FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).first<{title:string;google_event_id:string|null;google_organizer_user_id:string|null}>();
       if(!event) return Response.json({error:"Intervention introuvable."},{status:404});
+      if(event.google_event_id) await deleteCalendarEvent(event.google_organizer_user_id||user.userId,event.google_event_id);
       await DB.prepare("DELETE FROM events WHERE id=? AND project_id=?").bind(eventId,projectId).run();
       await logActivity(projectId,user,"event_deleted",`Intervention supprimée · ${event.title}`); return Response.json({ok:true});
     }
     return Response.json({error:"Action inconnue"},{status:400});
-  } catch(e) { if(e instanceof Response)return e; console.error(e); return Response.json({error:"Enregistrement impossible. Réessayez."},{status:500}); }
+  } catch(e) { if(e instanceof Response)return e; if(e instanceof CalendarError)return Response.json({error:e.message},{status:e.status}); console.error(e); return Response.json({error:"Enregistrement impossible. Réessayez."},{status:500}); }
 }
